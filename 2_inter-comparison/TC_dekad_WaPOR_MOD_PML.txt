@@ -1,0 +1,301 @@
+// GEE Script: TC_dekad_WaPOR_MOD_PML
+// Calculate uncertainty of WaPOR using TCA with MOD16 and PMLv2
+// Load three ImageCollections 
+// Define the date range
+var startDate = '2018-01-01';
+var endDate = '2022-12-31';
+
+// WaPOR ET: Apply scale factor (0.1) to convert units
+var collection1 = ee.ImageCollection('FAO/WAPOR/3/L1_AETI_D')
+                   .filterDate(startDate, endDate)
+                  .select('L1-AETI-D')
+                   .map(function(image) {
+                     return image.multiply(0.1)
+                                 .copyProperties(image, ['system:time_start']);
+                   });
+                                 
+// MODIS ET: Convert from kg/m²/8day to mm/day (scale 0.1 and divide by 8)
+var collection2 = ee.ImageCollection("MODIS/061/MOD16A2GF")
+                   .filterDate(startDate, endDate)
+                   .select('ET')
+                   .map(function(image) {
+                     return image.multiply(0.1).divide(8)
+                                 .copyProperties(image, ['system:time_start']);
+                   });
+
+// PML ET: No scaling needed (unit: mm/day), sum Ec, Es, Ei
+var collection3 = ee.ImageCollection("CAS/IGSNRR/PML/V2_v018")
+  .filterDate(startDate, endDate)
+  .select(['Ec','Es','Ei','ET_water'])
+  .map(function(img) {
+    var sum = img
+      .reduce(ee.Reducer.sum())      // sums Ec, Es, Ei into one band
+      .rename('ET_sum');             // rename the merged band
+    return sum.copyProperties(img, ['system:time_start']);
+  });
+
+ 
+// ============================Reproject to grid=============================
+// Reproject to the same grid (optional, adjust if needed)
+var targetGrid = collection3.first().projection();
+
+var resampleToGrid = function(image) {
+  return image.resample('bilinear').reproject({crs: targetGrid, scale: 500});  // Adjust scale if necessary
+};
+
+// Apply resampling to all collections
+collection1 = collection1.map(resampleToGrid);
+collection2 = collection2.map(resampleToGrid);
+collection3 = collection3.map(resampleToGrid);
+
+//==============================Resample to dekadal mean==================================
+// Using dates of WaPOR as target dates
+var targetDates = collection1.aggregate_array('system:time_start');
+// Linear interpolation
+function interpolateCollection(srcCol, targetDates) {
+  return ee.ImageCollection.fromImages(
+    targetDates.map(function(d) {
+      d = ee.Date(d);
+
+      // exact match
+      var exact = srcCol.filterDate(d, d.advance(1, 'day')).first();
+      exact = ee.Image(exact);
+
+      return ee.Algorithms.If(
+        exact, // if image exists on date d
+        exact.set('system:time_start', d.millis()),
+        (function() { //else interpolate between first image in 8day before and 8day after
+          var before = srcCol.filterDate(d.advance(-8, 'day'), d)
+                             .sort('system:time_start', false).first();
+          var after = srcCol.filterDate(d, d.advance(8, 'day'))
+                            .sort('system:time_start').first();
+          before = ee.Image(before);
+          after = ee.Image(after);
+
+          var tBefore = ee.Number(before.date().millis()); //get date of Before image
+          var tAfter = ee.Number(after.date().millis()); //get date of After image
+          var tTarget = ee.Number(d.millis()); //get target date of dekadal
+
+          var ratio = tTarget.subtract(tBefore).divide(tAfter.subtract(tBefore));
+          var interp = before.add(after.subtract(before).multiply(ratio));
+
+          return interp.set('system:time_start', d.millis());
+        })()
+      );
+    })
+  );
+}
+
+var interp_collection2 = interpolateCollection(collection2, targetDates);
+var interp_collection3 = interpolateCollection(collection3, targetDates);
+
+// print(interp_collection2);
+// print(interp_collection3);
+//====================== Collocate collections =========================
+// Create a combined collection with data from all three collections for each time step
+var combinedCollection = collection1.map(function(img) {
+  var date = img.date();
+  
+  var img2 = interp_collection2
+    .filterDate(date, date.advance(1, 'day'))
+    .first()
+    .toFloat()
+    .rename('MOD16A2GF');
+    
+  var img3 = interp_collection3
+    .filterDate(date, date.advance(1, 'day'))
+    .first()
+    .toFloat()
+    .rename('PMLv2');
+  
+  return img.toFloat()
+    .rename('WaPORv3L1') // rename original bands if needed
+    .addBands(img2)
+    .addBands(img3);
+});
+
+// Print the combined collection to verify
+// print('Combined Collection:', combinedCollection);
+
+// //================================ TRIPLE COLLOCATION ================================
+// Function to compute RMSE across the entire time-series for each grid cell
+var computeTripleCollocationX = function(collection) {
+  var variances = collection.reduce(ee.Reducer.variance())
+      .rename(['XX','YY','ZZ']);
+  //calculate covariances
+  var meanImage = collection.reduce(ee.Reducer.mean())
+    .rename(['X_mean','Y_mean','Z_mean']);
+  var anomalies = collection.map(function(img) {
+    return img
+      .subtract(meanImage)        // subtract per‐band mean
+      .rename(['XA','YA','ZA']);  // anomaly bands
+  });    
+  var XY = anomalies.map(function(img) {
+        return img.select('XA').multiply(img.select('YA'));
+      })
+      .reduce(ee.Reducer.mean())
+      .rename('XY');
+  var XZ = anomalies.map(function(img) {
+        return img.select('XA').multiply(img.select('ZA'));
+      })
+      .reduce(ee.Reducer.mean())
+      .rename('XZ');
+  var YZ = anomalies.map(function(img) {
+        return img.select('YA').multiply(img.select('ZA'));
+      })
+      .reduce(ee.Reducer.mean())
+      .rename('YZ');
+  
+  // Stoffelen 1998 sigma2_Ex = sigma2_X - sigma2_XY*sigma2_XZ / sigma2_YZ
+  var sigmaX = variances.select('XX').subtract(XY.multiply(XZ).divide(YZ)).sqrt();
+                        
+  // McColl 2014 rho2_Ex = sigma2_XY*sigma2_XZ / sigma2_X*sigma2_YZ
+  var rhoX = XY.multiply(XZ).divide(variances.select('XX').multiply(YZ)).sqrt();
+
+  return ee.Image.cat([
+    sigmaX.rename('sigmaX'),
+    rhoX.rename('rhoX')
+  ]);
+};
+
+// // Apply RMSE calculation over the combined collection
+var TC_outputs = computeTripleCollocationX(combinedCollection);
+
+//=============================== Export to GEE assets ============
+var world = ee.Geometry.BBox(-180, -60, 180, 80);
+var taskParams = {
+  image: TC_outputs,
+  description: 'WaPOR-MOD16-PMLv2',
+  assetId: 'projects/ee-wapor/assets/TCA/WaPOR-MOD16-PMLv2', // Change this to a unique path in your assets
+  region: world,
+  scale: 500, // 
+  maxPixels: 1e13,
+  crs: 'EPSG:4326',
+};
+
+// Schedule the export task.
+// Export.image.toAsset(taskParams);
+//=============================== Visualization: ET and TC results map =============================== 
+// Define the Viridis color palette
+var viridisPalette = [
+  '440154', '482576', '3E4A89', '31688E', '26828E', '1F9E89', 
+  '35B779', '6CCF57', 'B4DE2C', 'FDE725'
+];
+
+// ****Add ET maps*******
+var vizET = {
+  min: 0,
+  max: 10,
+  palette: viridisPalette
+};
+// select date
+var date_str = '2018-07-01';
+var date = ee.Date(date_str);
+var image = combinedCollection
+  .filterDate(date, date.advance(1, 'day'))
+  .first();
+  
+Map.addLayer(image.select('MOD16A2GF'), vizET, 'MOD16A2GFET');
+Map.addLayer(image.select('PMLv2'), vizET, 'PMLv2');
+Map.addLayer(image.select('WaPORv3L1'), vizET, 'WaPORv3L1ET');
+
+//****Add TC results layers to the right map panel*******
+// Define a visualization for each band.
+var vizSigma = {
+  min: 0,
+  max: 1,
+  palette: viridisPalette
+};
+var vizRho = {
+  min: 0,
+  max: 1,
+  palette: viridisPalette
+};
+
+Map.addLayer(TC_outputs.select('sigmaX'), vizSigma, 'Error STD');
+Map.addLayer(TC_outputs.select('rhoX'), vizRho, 'Correlation');
+
+//=============================== Visualization: Point time-series =============================== 
+var coord = plotPoint.coordinates();
+print(coord);
+var lat = coord.get(1);
+var lon = coord.get(0);
+// Add time-series plots
+var tsTitle = 'Dekadal mean ET for point at lon: ' + lon + ', lat: ' + lat;
+var tsChart = ui.Chart.image.series({
+  imageCollection: combinedCollection.select(['WaPORv3L1', 'MOD16A2GF', 'PMLv2']),
+  region: plotPoint, 
+  reducer: ee.Reducer.mean(), 
+  xProperty: 'system:time_start',
+  scale: 500
+});
+tsChart.setOptions({
+  title: tsTitle,
+  vAxis: {title: 'ET (mm/d)'},
+  hAxis: {title: 'Date', format: 'YYYY-MM'},
+  lineWidth: 2,
+  pointSize: 4,    
+  width: 150,
+  height: 150,
+  colors: ['#34A853', '#4285F4', '#EA4335'],
+  // interpolateNulls: true,
+  curveType: 'function',
+});
+print(tsChart);
+//Add scatterplots
+// Function to get the time series as a FeatureCollection.
+function getTimeSeriesFeatures(collection, region, reducer, scale) {
+  // Map a function over the image collection to reduce each image.
+  var featureCollection = collection.map(function(image) {
+    // Get the timestamp from the image metadata.
+    var date = image.date().millis();
+    
+    // Reduce the image to a single value at the given point.
+    var reducedValue = image.reduceRegion({
+      reducer: reducer,
+      geometry: region,
+      scale: scale
+    });
+    
+    // Convert the dictionary to a feature with a null geometry.
+    // The date and value are stored as properties.
+    return ee.Feature(null, reducedValue.set('system:time_start', date));
+  });
+  
+  return featureCollection;
+}
+
+// Get timeseries for scatterplots
+var timeSeriesFeatures = getTimeSeriesFeatures(
+  combinedCollection.select(['WaPORv3L1', 'MOD16A2GF', 'PMLv2']),
+  plotPoint,
+  ee.Reducer.mean(),
+  500
+);
+var scatterChart = ui.Chart.feature.byFeature({
+    features: timeSeriesFeatures,
+    xProperty: 'WaPORv3L1',
+    yProperties: ['MOD16A2GF', 'PMLv2']})
+  .setChartType('ScatterChart')
+  .setOptions({ 
+    pointSize: 10, 
+    colors: ['1d6b99', 'cf513e'],
+    width: 300, 
+    height: 300, 
+    titleX: 'WaPORv3L1 (mm/d)', 
+    titleY: 'Other Products (mm/d)' });
+print(scatterChart);
+// Add TCA results
+var rhoVal = TC_outputs.reduceRegion({
+  reducer: ee.Reducer.mean(),
+  geometry: plotPoint,
+  scale: 500
+}).get('rhoX');
+var sigmaVal = TC_outputs.reduceRegion({
+  reducer: ee.Reducer.mean(),
+  geometry: plotPoint,
+  scale: 500
+}).get('sigmaX');
+  
+print(ee.String('Correlation: ').cat(ee.Number(rhoVal).format()));
+print(ee.String('Error std: ').cat(ee.Number(sigmaVal).format()));
